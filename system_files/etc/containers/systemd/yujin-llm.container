@@ -1,0 +1,25 @@
+# yujin-os 로컬 모델 서버 (llama.cpp llama-server, Vulkan = AMD 내장·외장 그래픽 가속)
+# 모델은 /var/models/current.gguf 하나만 본다. 바꾸려면: yujin-model use <파일>
+# 주소: http://127.0.0.1:8080 (OpenAI 호환 /v1 + 채팅 화면). 이 기기 밖에서는 열리지 않는다.
+[Unit]
+Description=yujin-os local LLM (llama.cpp)
+ConditionPathExists=/var/models/current.gguf
+After=network-online.target
+
+[Container]
+# 이미지 태그는 받기 전에 확인하고 digest로 고정할 것(설계서 「모델 층」)
+Image=ghcr.io/ggml-org/llama.cpp:server-vulkan
+ContainerName=yujin-llm
+Volume=/var/models:/models:ro,Z
+AddDevice=/dev/dri
+PublishPort=127.0.0.1:8080:8080
+EnvironmentFile=-/etc/yujin-os/llm.env
+Exec=-m /models/current.gguf --host 0.0.0.0 --port 8080 -ngl 999 --jinja -c 32768
+NoNewPrivileges=true
+
+[Service]
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

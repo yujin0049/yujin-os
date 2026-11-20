@@ -164,6 +164,8 @@ Where the mode comes from (first match wins):
 2. System defaults in `/etc/grokbot/api-permissions.json`: `local` (modes for the user's own processes) and `origins` (`{"http://x.app.localhost:7311": {"audio": "ask"}}`). The phase-1 form, a list of capabilities, still works but grants **reads only**; `"*"` is ignored.
 3. Built in: the local user may read everything and is asked for writes; anything else is denied.
 
+**Agents (yujin-os).** <a id="agents"></a>The system file may also hold `agents`: systemd unit names (`.service`) mapped to modes, e.g. `{"yujin-agent.service": {"notifications": "allow", "files": "ask"}}`. A local caller identified as `local:uid=N:unit=<listed unit>` is not treated as the local user: it gets exactly the listed scopes, **reads included**, and any other scope is denied without a prompt (source `agent`). Only `/etc/grokbot/api-permissions.json` can list agents; the user's legacy `~/.config/grokbot/api-permissions.json` cannot. User grants for that principal still win, and the hard rules below still apply. The shipped entry gives `yujin-agent.service` `system` and `notifications` (allow) and `files`, `files-write`, `apps` (ask).
+
 The local user's **reads are always allowed**, whatever is stored (the dock polls status every 2 s); stored modes for `local` govern writes only.
 
 Hard rules that no file can change:

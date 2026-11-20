@@ -33,6 +33,12 @@ Where modes come from, first match wins:
 The local user's reads are always allowed; stored modes for local only
 govern writes.
 
+Agents (yujin-os): a local program that runs in a systemd unit listed
+under "agents" in the system file (e.g. the local AI agent,
+yujin-agent.service) is NOT treated as the local user. It gets exactly
+the scopes its entry lists, reads included; a scope it does not list is
+denied without a prompt. User grants for that principal still win.
+
 There is no blanket grant: "*" and app-wide grants are not accepted.
 Some scopes can never be silently written (ALWAYS_ASK): camera,
 microphone and power prompt on every use session / action, whatever the
@@ -138,6 +144,29 @@ def _system():
     return local, modes, caps
 
 
+def agent_unit(principal):
+    """The unit name if this local principal is a listed agent, else None."""
+    if not is_local(principal):
+        return None
+    rest = principal.split(":", 2)[2] if principal.count(":") >= 2 else ""
+    if not rest.startswith("unit="):
+        return None
+    unit = rest[5:]
+    return unit if unit in _agents() else None
+
+
+def _agents():
+    """unit -> modes, from the "agents" section of the system file only
+    (not the user's legacy file: an agent must not widen its own list)."""
+    out = {}
+    ag = _load_json(paths.permissions_paths()[0]).get("agents")
+    if isinstance(ag, dict):
+        for unit, g in ag.items():
+            if isinstance(unit, str) and unit.endswith(".service") and isinstance(g, dict):
+                out[unit] = {sc: m for sc, m in g.items() if sc in SCOPES and m in MODES}
+    return out
+
+
 def _user():
     g = _load_json(grants_path()).get("grants")
     return g if isinstance(g, dict) else {}
@@ -178,7 +207,8 @@ def mode_for(principal, scope, access, capability=None):
         if appdata.app_for(principal) is not None:
             return "allow", "app"
         return "deny", "default"
-    if is_local(principal) and access == "read":
+    agent = agent_unit(principal)
+    if is_local(principal) and access == "read" and agent is None:
         # The user's own processes always read (the dock polls status);
         # a stored mode only governs writes.
         return "allow", "builtin"
@@ -186,6 +216,12 @@ def mode_for(principal, scope, access, capability=None):
     ug = _user().get(principal, {})
     if isinstance(ug, dict) and isinstance(ug.get(scope), dict) and ug[scope].get("mode") in MODES:
         mode, source = ug[scope]["mode"], "user"
+    if mode is None and agent is not None:
+        m = _agents()[agent].get(scope)
+        if m is not None:
+            mode, source = m, "agent"
+        else:
+            return "deny", "agent"
     if mode is None:
         local, modes, caps = _system()
         if is_local(principal):
@@ -281,6 +317,7 @@ def listing(principal=None, include=None):
     local, modes, caps = _system()
     user = _user()
     names = set(user) | {"origin:" + o for o in set(modes) | set(caps)}
+    names |= {"local:uid=%d:unit=%s" % (os.getuid(), u) for u in _agents()}
     if include:
         names.add(include)
     if principal is not None:

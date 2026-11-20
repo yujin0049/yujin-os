@@ -183,7 +183,7 @@ form button:disabled{opacity:.5}
 </form>
 <script>
 const LABEL = {yujin_kangsaryo:"초과강사료", yujin_jangbu:"장부", yujin_week:"한 주 수업", yujin_query:"DB 조회",
-               yujin_summary:"요약", yujin_schema:"표 구조", yujin_flag:"확인필요 기록"};
+               yujin_summary:"요약", yujin_schema:"표 구조", yujin_flag:"확인필요 기록", yujin_doccheck:"공문 검사"};
 const log = document.getElementById("log"), q = document.getElementById("q"), send = document.getElementById("send");
 function add(text, cls, tools) {
   const d = document.createElement("div"); d.className = "msg " + cls; d.textContent = text;

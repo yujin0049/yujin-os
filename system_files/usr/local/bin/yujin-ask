@@ -78,10 +78,10 @@ class MCP:
                 return r.get("result") or {}
 
     def close(self):
+        self.p.stdin.close()
         try:
-            self.p.stdin.close()
             self.p.wait(timeout=5)
-        except Exception:
+        except subprocess.TimeoutExpired:
             self.p.kill()
 
 
@@ -96,6 +96,9 @@ def chat(llm, messages, tools):
 
 
 def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
     conf = load_conf()
     servers, route, tools = [], {}, []
     try:

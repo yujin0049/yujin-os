@@ -9,6 +9,7 @@
 | 모델 | 없음(클라우드) | `yujin-llm` 서비스: llama.cpp `llama-server`(Vulkan) 컨테이너, `/var/models/current.gguf` |
 | 모델 관리 | — | `yujin-model list · get · use · status` (Ollama 안 씀) |
 | 일 시키기 | — | `yujin-ask "질문"`: 로컬 모델이 MCP 도구(yujin-db 등)를 직접 불러 답함. 모델 주소는 이 기기만, 설정 `/etc/yujin-os/agent.json`·`~/.config/yujin-os/agent.json` |
+| 휴대폰 창 | — | `yujin-ask serve`: 127.0.0.1:8090 채팅 화면(홈 화면 앱으로 추가 가능), 쓴 도구를 답 아래에 표시, 한 번에 한 질문 |
 
 에이전트는 OpenAI 호환 주소 `http://127.0.0.1:8080/v1` 하나로만 말한다. 모델을 바꿔도 OS·에이전트는 그대로다.
 

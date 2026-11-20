@@ -3,19 +3,24 @@
 
   yujin-ask "이번 주 휴강 몇 건?"
   yujin-ask --tools          # 쓸 수 있는 도구만 보기
-  yujin-ask serve [포트]     # 휴대폰·브라우저용 채팅 화면(127.0.0.1:8090, 한 번에 한 질문)
+  yujin-ask serve [포트]     # 휴대폰·브라우저용 채팅 화면(127.0.0.1:8090)
+
+serve: 대화 여러 개를 동시에 보낼 수 있다. 질문은 먼저 디스크(~/.local/state/yujin-os/ask.db)에 적고 줄을 세운 뒤
+workers명이 차례로 처리한다(workers = llama-server -np 칸 수). 꺼졌다 켜지면 끝나지 않은 질문을 이어서 처리한다.
 
 설정 (뒤가 앞을 덮음): /etc/yujin-os/agent.json, ~/.config/yujin-os/agent.json
   {"llm": "http://127.0.0.1:8080/v1",
    "mcp": {"yujin-db": ["python3", "-I", "-X", "utf8", "/var/home/yujin/yujin-db/mcp_server.py"]},
-   "max_steps": 8}
+   "max_steps": 8, "workers": 1}
 밖으로 나가는 통신 없음: llm 주소가 127.0.0.1/localhost가 아니면 거부한다.
 결재·상신·발송·돈·삭제 도구는 붙이지 않는다(사람만 하는 일).
 """
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+import threading
 import urllib.parse
 import urllib.request
 
@@ -25,7 +30,7 @@ SYSTEM = ("너는 유진님의 업무 보조다. 사실(날짜·시수·금액·
 
 
 def load_conf():
-    conf = {"llm": "http://127.0.0.1:8080/v1", "mcp": {}, "max_steps": 8}
+    conf = {"llm": "http://127.0.0.1:8080/v1", "mcp": {}, "max_steps": 8, "workers": 1}
     paths = ["/etc/yujin-os/agent.json",
              os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "yujin-os", "agent.json")]
     extra = os.environ.get("YUJIN_AGENT_CONF")
@@ -37,7 +42,7 @@ def load_conf():
                 d = json.load(f)
         except (OSError, ValueError):
             continue
-        for k in ("llm", "max_steps"):
+        for k in ("llm", "max_steps", "workers"):
             if k in d:
                 conf[k] = d[k]
         if isinstance(d.get("mcp"), dict):
@@ -110,8 +115,11 @@ def connect(conf):
     return servers, route, tools
 
 
-def ask(conf, route, tools, question):
-    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}]
+def ask(conf, route, tools, question, history=()):
+    messages = [{"role": "system", "content": SYSTEM}]
+    for q, a in history:
+        messages += [{"role": "user", "content": q}, {"role": "assistant", "content": a}]
+    messages.append({"role": "user", "content": question})
     used = []
     for _ in range(int(conf["max_steps"])):
         m = chat(conf["llm"], messages, tools)
@@ -133,6 +141,100 @@ def ask(conf, route, tools, question):
     return {"answer": "", "tools": used, "error": "단계가 %s번을 넘어 멈췄습니다. 질문을 좁혀 주세요." % conf["max_steps"]}
 
 
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "yujin-os", "ask.db")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS 대화 (
+  번호 INTEGER PRIMARY KEY,
+  제목 TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS 질문 (
+  번호 INTEGER PRIMARY KEY,
+  대화 INTEGER NOT NULL REFERENCES 대화(번호),
+  글 TEXT NOT NULL,
+  상태 TEXT NOT NULL DEFAULT '대기' CHECK (상태 IN ('대기', '처리중', '끝', '실패')),
+  답 TEXT,
+  도구 TEXT NOT NULL DEFAULT '[]',
+  오류 TEXT,
+  받은때 TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+  끝난때 TEXT
+) STRICT;
+"""
+
+
+class Queue:
+    def __init__(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode = WAL")
+        self.db.executescript(SCHEMA)
+        self.db.execute("UPDATE 질문 SET 상태 = '대기' WHERE 상태 = '처리중'")
+        self.cv = threading.Condition()
+
+    def add(self, chat, text):
+        with self.cv:
+            if chat is None:
+                chat = self.db.execute("INSERT INTO 대화 (제목) VALUES (?)", (text[:40],)).lastrowid
+            elif not self.db.execute("SELECT 1 FROM 대화 WHERE 번호 = ?", (chat,)).fetchone():
+                return None
+            n = self.db.execute("INSERT INTO 질문 (대화, 글) VALUES (?, ?)", (chat, text)).lastrowid
+            self.cv.notify()
+            return {"chat": chat, "id": n}
+
+    def retry(self, n):
+        with self.cv:
+            changed = self.db.execute("UPDATE 질문 SET 상태 = '대기', 오류 = NULL WHERE 번호 = ? AND 상태 = '실패'", (n,)).rowcount
+            self.cv.notify()
+            return changed == 1
+
+    def take(self):
+        with self.cv:
+            while True:
+                row = self.db.execute("SELECT 번호, 대화, 글 FROM 질문 WHERE 상태 = '대기' ORDER BY 번호 LIMIT 1").fetchone()
+                if row:
+                    self.db.execute("UPDATE 질문 SET 상태 = '처리중' WHERE 번호 = ?", (row[0],))
+                    history = self.db.execute("SELECT 글, 답 FROM 질문 WHERE 대화 = ? AND 번호 < ? AND 상태 = '끝' "
+                                              "ORDER BY 번호 DESC LIMIT 4", (row[1], row[0])).fetchall()
+                    return row[0], row[2], history[::-1]
+                self.cv.wait()
+
+    def finish(self, n, out):
+        with self.cv:
+            self.db.execute("UPDATE 질문 SET 상태 = ?, 답 = ?, 도구 = ?, 오류 = ?, 끝난때 = datetime('now', 'localtime') WHERE 번호 = ?",
+                            ("실패" if out.get("error") else "끝", out.get("answer"),
+                             json.dumps(out.get("tools", []), ensure_ascii=False), out.get("error"), n))
+
+    def chats(self):
+        with self.cv:
+            rows = self.db.execute("SELECT d.번호, d.제목, SUM(q.상태 IN ('대기', '처리중')) FROM 대화 d JOIN 질문 q ON q.대화 = d.번호 "
+                                   "GROUP BY d.번호 ORDER BY MAX(q.번호) DESC LIMIT 50").fetchall()
+        return [{"id": a, "title": b, "busy": bool(c)} for a, b, c in rows]
+
+    def jobs(self, chat):
+        with self.cv:
+            rows = self.db.execute("SELECT 번호, 글, 상태, 답, 도구, 오류, (SELECT COUNT(*) FROM 질문 p WHERE p.상태 IN ('대기', '처리중') "
+                                   "AND p.번호 < q.번호) FROM 질문 q WHERE 대화 = ? ORDER BY 번호", (chat,)).fetchall()
+        return [{"id": n, "q": g, "status": st, "answer": a, "tools": json.loads(t), "error": e, "ahead": ah}
+                for n, g, st, a, t, e, ah in rows]
+
+
+def work(conf, queue):
+    servers, route, tools = connect(conf)
+    while True:
+        n, text, history = queue.take()
+        try:
+            out = ask(conf, route, tools, text, history)
+        except OSError as e:
+            out = {"answer": "", "tools": [], "error": "로컬 모델에 닿지 않습니다(%s). llama-server가 켜져 있는지 보고 「다시」를 누르세요." % e}
+        except Exception as e:
+            out = {"answer": "", "tools": [], "error": "처리하다 멈췄습니다(%s: %s). 「다시」를 누르세요." % (type(e).__name__, e)}
+        queue.finish(n, out)
+        if any(s.p.poll() is not None for s in servers):
+            for s in servers:
+                s.close()
+            servers, route, tools = connect(conf)
+
+
 PAGE = """<!doctype html>
 <html lang="ko">
 <head>
@@ -144,19 +246,33 @@ PAGE = """<!doctype html>
 <link rel="manifest" href="/manifest.webmanifest">
 <title>유진 피클</title>
 <style>
-:root{--bg:#f6f7f9;--panel:#fff;--fg:#1b1f24;--muted:#66707b;--line:#dde2e8;--me:#1f5f8b;--me-fg:#fff;--chip:#eef2f6;--err:#b42318}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--panel:#171a20;--fg:#e7ebef;--muted:#98a2ad;--line:#2a2f37;--me:#3d7fb0;--me-fg:#fff;--chip:#20252d;--err:#f97066}}
+:root{--bg:#f6f7f9;--panel:#fff;--side:#eef1f4;--fg:#1b1f24;--muted:#66707b;--line:#dde2e8;--me:#1f5f8b;--me-fg:#fff;--chip:#e6ebf0;--err:#b42318;--sel:#dfe6ee}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--panel:#171a20;--side:#13161b;--fg:#e7ebef;--muted:#98a2ad;--line:#2a2f37;--me:#3d7fb0;--me-fg:#fff;--chip:#232830;--err:#f97066;--sel:#242a33}}
 *{box-sizing:border-box}
 html,body{height:100%;margin:0}
-body{background:var(--bg);color:var(--fg);font:16px/1.55 "Pretendard","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif;display:flex;flex-direction:column}
-header{padding:calc(env(safe-area-inset-top) + 12px) 16px 10px;border-bottom:1px solid var(--line);background:var(--panel)}
-header h1{margin:0;font-size:17px}
-header p{margin:2px 0 0;color:var(--muted);font-size:13px}
+body{background:var(--bg);color:var(--fg);font:16px/1.55 "Pretendard","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif;display:flex}
+aside{width:270px;flex:none;background:var(--side);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:calc(env(safe-area-inset-top) + 12px) 10px 12px}
+aside button.new{border:1px solid var(--line);background:var(--panel);color:var(--fg);border-radius:10px;padding:9px 12px;font:inherit;font-weight:600;text-align:left}
+aside h2{font-size:12px;color:var(--muted);margin:16px 6px 6px;font-weight:600}
+#chats{overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:2px}
+#chats a{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;color:var(--fg);text-decoration:none;font-size:14px}
+#chats a span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#chats a.on{background:var(--sel)}
+#chats a i{width:8px;height:8px;border-radius:50%;background:var(--me);flex:none;animation:p 1.2s infinite}
+@keyframes p{50%{opacity:.3}}
+.wrap{flex:1;min-width:0;display:flex;flex-direction:column}
+header{display:flex;align-items:center;gap:10px;padding:calc(env(safe-area-inset-top) + 10px) 16px 10px;border-bottom:1px solid var(--line);background:var(--panel)}
+header button{display:none;border:0;background:none;color:var(--fg);font-size:22px;padding:0 4px}
+header div{min-width:0}
+header h1{margin:0;font-size:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+header p{margin:0;color:var(--muted);font-size:12px}
 main{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
 .msg{max-width:88%;padding:10px 13px;border-radius:14px;white-space:pre-wrap;word-break:break-word}
 .me{align-self:flex-end;background:var(--me);color:var(--me-fg);border-bottom-right-radius:4px}
 .ai{align-self:flex-start;background:var(--panel);border:1px solid var(--line);border-bottom-left-radius:4px}
+.ai.wait{color:var(--muted)}
 .ai.err{color:var(--err)}
+.ai button{margin-top:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:8px;padding:4px 10px;font:inherit;font-size:13px}
 .tools{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
 .tools span{font-size:12px;color:var(--muted);background:var(--chip);border-radius:999px;padding:2px 9px}
 .hint{display:flex;flex-wrap:wrap;gap:8px}
@@ -164,50 +280,78 @@ main{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:
 form{display:flex;gap:8px;padding:10px 16px calc(env(safe-area-inset-bottom) + 10px);border-top:1px solid var(--line);background:var(--panel)}
 textarea{flex:1;resize:none;border:1px solid var(--line);border-radius:12px;padding:10px 12px;font:inherit;background:var(--bg);color:var(--fg);max-height:120px}
 form button{border:0;border-radius:12px;padding:0 16px;background:var(--me);color:var(--me-fg);font:inherit;font-weight:600}
-form button:disabled{opacity:.5}
+.dim{display:none}
+@media (max-width:760px){
+  aside{position:fixed;inset:0 auto 0 0;z-index:3;transform:translateX(-100%);transition:transform .2s;width:82%;max-width:300px}
+  body.open aside{transform:none}
+  body.open .dim{display:block;position:fixed;inset:0;background:#0006;z-index:2}
+  header button{display:block}
+}
 </style>
 </head>
 <body>
-<header><h1>유진 피클</h1><p>이 기기의 로컬 AI · 학교 자료는 밖으로 나가지 않습니다</p></header>
-<main id="log">
-  <div class="msg ai">무엇을 볼까요? 숫자는 yujin-db에서 꺼내 옵니다.</div>
-  <div class="hint" id="hint">
-    <button type="button">이번 주 휴강·보강</button>
-    <button type="button">11월분 초과강사료</button>
-    <button type="button">장부 다음 할 일</button>
-  </div>
-</main>
-<form id="f">
-  <textarea id="q" rows="1" placeholder="물어보세요" aria-label="질문"></textarea>
-  <button id="send" type="submit">보내기</button>
-</form>
+<aside>
+  <button class="new" id="new" type="button">+ 새 대화</button>
+  <h2>대화</h2>
+  <nav id="chats"></nav>
+</aside>
+<div class="dim" id="dim"></div>
+<div class="wrap">
+  <header><button id="menu" type="button" aria-label="대화 목록">☰</button><div><h1 id="title">새 대화</h1><p>이 기기의 로컬 AI · 학교 자료는 밖으로 나가지 않습니다</p></div></header>
+  <main id="log"></main>
+  <form id="f">
+    <textarea id="q" rows="1" placeholder="물어보세요 · 여러 개 보내도 됩니다" aria-label="질문"></textarea>
+    <button type="submit">보내기</button>
+  </form>
+</div>
 <script>
 const LABEL = {yujin_kangsaryo:"초과강사료", yujin_jangbu:"장부", yujin_week:"한 주 수업", yujin_query:"DB 조회",
                yujin_summary:"요약", yujin_schema:"표 구조", yujin_flag:"확인필요 기록", yujin_doccheck:"공문 검사"};
-const log = document.getElementById("log"), q = document.getElementById("q"), send = document.getElementById("send");
-function add(text, cls, tools) {
-  const d = document.createElement("div"); d.className = "msg " + cls; d.textContent = text;
-  if (tools && tools.length) {
-    const t = document.createElement("div"); t.className = "tools";
-    for (const name of tools) { const s = document.createElement("span"); s.textContent = LABEL[name.split("__").pop()] || name; t.appendChild(s); }
-    d.appendChild(t);
+const HINTS = ["이번 주 휴강·보강", "11월분 초과강사료", "장부 다음 할 일"];
+const $ = id => document.getElementById(id);
+let cur = Number(new URLSearchParams(location.hash.slice(1)).get("c")) || null, shown = "";
+const api = (path, body) => fetch(path, body ? {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)} : {}).then(r => r.json());
+function el(tag, cls, text) { const d = document.createElement(tag); if (cls) d.className = cls; if (text != null) d.textContent = text; return d; }
+function go(c) { cur = c; history.replaceState(null, "", c ? "#c=" + c : "#"); document.body.classList.remove("open"); shown = ""; refresh(); }
+function renderJobs(jobs) {
+  const key = JSON.stringify(jobs); if (key === shown) return; shown = key;
+  const log = $("log"), atEnd = log.scrollHeight - log.scrollTop - log.clientHeight < 40; log.replaceChildren();
+  if (!jobs.length) {
+    log.append(el("div", "msg ai", "무엇을 볼까요? 숫자는 yujin-db에서 꺼내 옵니다."));
+    const h = el("div", "hint"); for (const t of HINTS) { const b = el("button", "", t); b.type = "button"; b.onclick = () => send(t); h.append(b); } log.append(h); return;
   }
-  log.appendChild(d); log.scrollTop = log.scrollHeight; return d;
+  for (const j of jobs) {
+    log.append(el("div", "msg me", j.q));
+    let d;
+    if (j.status === "대기") d = el("div", "msg ai wait", j.ahead ? "줄 서는 중 · 앞에 " + j.ahead + "개" : "곧 시작합니다");
+    else if (j.status === "처리중") d = el("div", "msg ai wait", "찾아보는 중…");
+    else if (j.status === "실패") { d = el("div", "msg ai err", j.error); const b = el("button", "", "다시"); b.type = "button"; b.onclick = () => api("/api/retry/" + j.id, {}).then(refresh); d.append(b); }
+    else d = el("div", "msg ai", j.answer || "(답이 비었습니다)");
+    if (j.tools.length) { const t = el("div", "tools"); for (const n of j.tools) t.append(el("span", "", LABEL[n.split("__").pop()] || n)); d.append(t); }
+    log.append(d);
+  }
+  if (atEnd) log.scrollTop = log.scrollHeight;
 }
-async function ask(text) {
-  if (!text.trim() || send.disabled) return;
-  add(text, "me"); q.value = ""; send.disabled = true;
-  const wait = add("찾아보는 중…", "ai");
+async function refresh() {
   try {
-    const r = await fetch("/ask", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({q: text})});
-    const j = await r.json(); wait.remove();
-    if (j.error) add(j.error, "ai err", j.tools); else add(j.answer || "(답이 비었습니다)", "ai", j.tools);
-  } catch (e) { wait.remove(); add("맥북에 닿지 않습니다. 맥북이 켜져 있는지 보세요.", "ai err"); }
-  send.disabled = false; q.focus();
+    const chats = await api("/api/chats"), nav = $("chats"); nav.replaceChildren();
+    for (const c of chats) { const a = el("a", c.id === cur ? "on" : ""); a.href = "#c=" + c.id; a.onclick = e => { e.preventDefault(); go(c.id); }; a.append(el("span", "", c.title)); if (c.busy) a.append(el("i")); nav.append(a); }
+    const mine = chats.find(c => c.id === cur); $("title").textContent = mine ? mine.title : "새 대화";
+    renderJobs(cur ? await api("/api/chats/" + cur) : []);
+  } catch (e) { $("title").textContent = "맥북에 닿지 않습니다 — 다시 시도 중"; }
 }
-document.getElementById("f").addEventListener("submit", e => { e.preventDefault(); ask(q.value); });
-q.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); ask(q.value); } });
-document.getElementById("hint").addEventListener("click", e => { if (e.target.tagName === "BUTTON") ask(e.target.textContent); });
+async function send(text) {
+  if (!text.trim()) return; $("q").value = "";
+  const r = await api("/api/ask", {q: text, chat: cur});
+  if (r.error) { alert(r.error); return; }
+  if (r.chat !== cur) go(r.chat); else refresh();
+}
+$("f").onsubmit = e => { e.preventDefault(); send($("q").value); };
+$("q").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send($("q").value); } };
+$("new").onclick = () => go(null);
+$("menu").onclick = () => document.body.classList.add("open");
+$("dim").onclick = () => document.body.classList.remove("open");
+refresh(); setInterval(refresh, 1500);
 </script>
 </body>
 </html>
@@ -217,12 +361,16 @@ MANIFEST = json.dumps({"name": "유진 피클", "short_name": "유진", "start_u
                        "background_color": "#0f1115", "theme_color": "#0f1115", "lang": "ko"}, ensure_ascii=False)
 
 
-def serve(conf, route, tools, port):
+def serve(conf, port):
     import http.server
+    queue = Queue(STATE)
+    workers = int(conf["workers"])
+    for _ in range(workers):
+        threading.Thread(target=work, args=(conf, queue), daemon=True).start()
 
     class Handler(http.server.BaseHTTPRequestHandler):
-        def _send(self, code, body, ctype):
-            data = body.encode("utf-8")
+        def _send(self, code, body, ctype="application/json"):
+            data = (body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
@@ -231,33 +379,40 @@ def serve(conf, route, tools, port):
             self.wfile.write(data)
 
         def do_GET(self):
+            parts = self.path.strip("/").split("/")
             if self.path in ("/", "/index.html"):
                 self._send(200, PAGE, "text/html; charset=utf-8")
             elif self.path == "/manifest.webmanifest":
                 self._send(200, MANIFEST, "application/manifest+json")
+            elif parts == ["api", "chats"]:
+                self._send(200, queue.chats())
+            elif parts[:2] == ["api", "chats"] and len(parts) == 3 and parts[2].isdigit():
+                self._send(200, queue.jobs(int(parts[2])))
             else:
-                self._send(404, "없는 주소입니다.", "text/plain; charset=utf-8")
+                self._send(404, {"error": "없는 주소입니다: %s" % self.path})
 
         def do_POST(self):
-            if self.path != "/ask":
-                return self._send(404, "없는 주소입니다.", "text/plain; charset=utf-8")
+            parts = self.path.strip("/").split("/")
+            if parts[:2] == ["api", "retry"] and len(parts) == 3 and parts[2].isdigit():
+                ok = queue.retry(int(parts[2]))
+                return self._send(200 if ok else 409, {"ok": ok} if ok else {"error": "실패한 질문만 다시 보낼 수 있습니다."})
+            if parts != ["api", "ask"]:
+                return self._send(404, {"error": "없는 주소입니다: %s" % self.path})
             try:
-                question = str(json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}").get("q", "")).strip()
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                question, chat = str(body.get("q", "")).strip(), body.get("chat")
             except (ValueError, AttributeError):
-                question = None
-            if not question:
-                return self._send(400, json.dumps({"error": "질문을 q 칸에 담은 JSON으로 보내세요. 예: {\"q\": \"이번 주 휴강\"}"}, ensure_ascii=False), "application/json")
-            try:
-                out = ask(conf, route, tools, question)
-            except OSError as e:
-                out = {"answer": "", "tools": [], "error": "로컬 모델에 닿지 않습니다(%s). llama-server가 켜져 있는지 보세요." % e}
-            self._send(200, json.dumps(out, ensure_ascii=False), "application/json")
+                question, chat = "", None
+            if not question or not (chat is None or isinstance(chat, int)):
+                return self._send(400, {"error": "질문을 q 칸에 담은 JSON으로 보내세요. 이어서 물을 때는 chat에 대화 번호. 예: {\"q\": \"이번 주 휴강\"}"})
+            r = queue.add(chat, question)
+            self._send(200 if r else 404, r or {"error": "대화 %s번이 없습니다. chat 없이 보내면 새 대화가 됩니다." % chat})
 
         def log_message(self, *a):
             pass
 
-    print("yujin-ask: http://127.0.0.1:%d 에서 기다립니다(한 번에 한 질문)." % port, file=sys.stderr)
-    http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    print("yujin-ask: http://127.0.0.1:%d 에서 기다립니다(일꾼 %d명, 줄 %s)." % (port, workers, STATE), file=sys.stderr)
+    http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 
 def main(argv):
@@ -265,14 +420,14 @@ def main(argv):
         print(__doc__.strip())
         return 0
     conf = load_conf()
+    if argv[:1] == ["serve"]:
+        serve(conf, int(argv[1]) if len(argv) > 1 else 8090)
+        return 0
     servers, route, tools = connect(conf)
     try:
         if argv[:1] == ["--tools"]:
             for t in tools:
                 print(t["function"]["name"], "-", t["function"]["description"])
-            return 0
-        if argv[:1] == ["serve"]:
-            serve(conf, route, tools, int(argv[1]) if len(argv) > 1 else 8090)
             return 0
         q = " ".join(argv).strip() or sys.stdin.read().strip()
         if not q:

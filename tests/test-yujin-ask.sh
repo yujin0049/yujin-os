@@ -46,4 +46,20 @@ printf '{"llm":"http://example.com/v1"}' > "$tmp/bad.json"
 if XDG_CONFIG_HOME="$tmp" YUJIN_AGENT_CONF="$tmp/bad.json" python3 "$here/system_files/usr/local/bin/yujin-ask" hi >/dev/null 2>&1; then
   echo "FAIL: remote llm accepted"; exit 1
 fi
+# serve: 질문 둘을 동시에 받아 둘 다 끝내고, 처리 중에 죽어도 다시 켜면 이어서 끝낸다
+state="$tmp/state"; sp=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+run_serve() { XDG_STATE_HOME="$state" XDG_CONFIG_HOME="$tmp" YUJIN_AGENT_CONF="$tmp/ok.json" python3 "$here/system_files/usr/local/bin/yujin-ask" serve "$sp" 2>/dev/null & serve_pid=$!; for _ in $(seq 50); do curl -s -m 1 "127.0.0.1:$sp/api/chats" >/dev/null && break; sleep 0.1; done; }
+trap 'kill "${llm_pid:-}" "${serve_pid:-}" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+run_serve
+curl -s -m 5 -X POST "127.0.0.1:$sp/api/ask" -d '{"q":"하나"}' >/dev/null & a=$!
+curl -s -m 5 -X POST "127.0.0.1:$sp/api/ask" -d '{"q":"둘"}' >/dev/null & b=$!
+wait "$a" "$b"
+done_count() { python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute(\"SELECT COUNT(*) FROM 질문 WHERE 상태='끝'\").fetchone()[0])" "$state/yujin-os/ask.db"; }
+for _ in $(seq 50); do [[ "$(done_count)" == 2 ]] && break; sleep 0.1; done
+[[ "$(done_count)" == 2 ]] || { echo "FAIL: serve concurrent: $(done_count)"; exit 1; }
+kill -9 "$serve_pid"; wait "$serve_pid" 2>/dev/null || true
+python3 -c "import sqlite3,sys;c=sqlite3.connect(sys.argv[1]);c.execute(\"INSERT INTO 질문 (대화, 글, 상태) VALUES (1, '셋', '처리중')\");c.commit()" "$state/yujin-os/ask.db"
+run_serve
+for _ in $(seq 50); do [[ "$(done_count)" == 3 ]] && break; sleep 0.1; done
+[[ "$(done_count)" == 3 ]] || { echo "FAIL: serve resume after crash: $(done_count)"; exit 1; }
 echo "PASS test-yujin-ask.sh"

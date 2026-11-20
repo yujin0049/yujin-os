@@ -92,7 +92,7 @@ class MCP:
 
 
 def chat(llm, messages, tools):
-    body = {"model": "local", "messages": messages, "temperature": 0.2}
+    body = {"model": "local", "messages": messages, "temperature": 0.2, "chat_template_kwargs": {"enable_thinking": False}}
     if tools:
         body["tools"] = tools
     req = urllib.request.Request(llm.rstrip("/") + "/chat/completions", data=json.dumps(body).encode(),

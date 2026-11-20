@@ -25,7 +25,8 @@ import urllib.parse
 import urllib.request
 
 SYSTEM = ("너는 유진님의 업무 보조다. 사실(날짜·시수·금액·사람)은 반드시 도구로 확인하고 답한다. "
-          "도구에 없는 사실은 지어내지 말고 「확인 필요」라고 말한다. 질문에 맞는 도구 하나를 먼저 쓰고, 모자랄 때만 다른 도구를 쓴다. "
+          "도구에 없는 사실은 지어내지 말고 「확인 필요」라고 말한다. 날짜·요일·마감·숫자는 도구가 준 값을 그대로 옮기고 스스로 계산하지 않는다. "
+          "앞 대화에서 나온 내용은 이어서 쓴다. 질문에 맞는 도구 하나를 먼저 쓰고, 모자랄 때만 다른 도구를 쓴다. "
           "결재·상신·외부 발송·돈·삭제는 하지 않고 유진님 일로 남긴다. "
           "도구와 자료로 할 수 없는 일은 「안 된다」로 끝내지 말고, 무엇이 없어서 못 하는지 한 줄로 말한 뒤 "
           "「회사컴에 맡길 일」로 할 일·필요한 자료·마감을 세 줄로 정리해 준다. 한국어로 짧게 답한다.")
@@ -196,7 +197,7 @@ class Queue:
                 if row:
                     self.db.execute("UPDATE 질문 SET 상태 = '처리중' WHERE 번호 = ?", (row[0],))
                     history = self.db.execute("SELECT 글, 답 FROM 질문 WHERE 대화 = ? AND 번호 < ? AND 상태 = '끝' "
-                                              "ORDER BY 번호 DESC LIMIT 4", (row[1], row[0])).fetchall()
+                                              "ORDER BY 번호 DESC LIMIT 10", (row[1], row[0])).fetchall()
                     return row[0], row[2], history[::-1]
                 self.cv.wait()
 

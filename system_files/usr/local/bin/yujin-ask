@@ -4,6 +4,10 @@
   yujin-ask "이번 주 휴강 몇 건?"
   yujin-ask --tools          # 쓸 수 있는 도구만 보기
   yujin-ask serve [포트]     # 휴대폰·브라우저용 채팅 화면(127.0.0.1:8090)
+  yujin-ask bench 시험지.json # 업무 시험지로 정답률·걸린 초를 잰다(JSON 출력)
+
+bench: 시험지는 [{"q": 질문, "answer_sql": [정답을 뽑는 SELECT, ...]}]. 정답은 손으로 적지 않고
+yujin_query 도구로 DB에서 뽑아, 답에 그 값이 모두 들어 있으면 맞음(쉼표·띄어쓰기는 무시).
 
 serve: 대화 여러 개를 동시에 보낼 수 있다. 질문은 먼저 디스크(~/.local/state/yujin-os/ask.db)에 적고 줄을 세운 뒤
 workers명이 차례로 처리한다(workers = llama-server -np 칸 수). 꺼졌다 켜지면 끝나지 않은 질문을 이어서 처리한다.
@@ -418,6 +422,41 @@ def serve(conf, port):
     http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 
+def bench(conf, route, tools, path):
+    import re
+    import time
+    norm = lambda t: re.sub(r"[\s,]", "", str(t))
+    query = next((v for k, v in route.items() if k.endswith("__yujin_query")), None)
+    if query is None:
+        sys.exit("yujin-ask: bench는 yujin_query 도구가 있는 MCP(yujin-db)가 필요합니다. agent.json의 mcp를 보세요.")
+    with open(path, encoding="utf-8") as f:
+        cases = json.load(f)
+    results = []
+    for c in cases:
+        want = []
+        for sql in c["answer_sql"]:
+            res = query[0].call("tools/call", {"name": query[1], "arguments": {"sql": sql}})
+            lines = "\n".join(x.get("text", "") for x in res.get("content", [])).strip().splitlines()
+            value = lines[1].split("\t")[0] if len(lines) > 1 else ""
+            want.append(value[:-2] if re.fullmatch(r"-?\d+\.0", value) else value)
+        t0 = time.time()
+        try:
+            out = ask(conf, route, tools, c["q"])
+        except OSError as e:
+            out = {"answer": "", "tools": [], "error": str(e)}
+        sec = round(time.time() - t0, 1)
+        missing = [w for w in want if not w or norm(w) not in norm(out.get("answer", ""))]
+        results.append({"q": c["q"], "ok": not missing and "error" not in out, "sec": sec, "want": want,
+                        "missing": missing, "tools": [t.split("__")[-1] for t in out["tools"]],
+                        "answer": out.get("answer", ""), "error": out.get("error")})
+        print("%s %5.1f초 %s" % ("O" if results[-1]["ok"] else "X", sec, c["q"]), file=sys.stderr)
+    secs = sorted(r["sec"] for r in results)
+    summary = {"맞음": sum(r["ok"] for r in results), "전체": len(results),
+               "중간값_초": secs[len(secs) // 2] if secs else None, "최대_초": secs[-1] if secs else None}
+    print(json.dumps({"요약": summary, "문제": results}, ensure_ascii=False, indent=1))
+    return 0 if summary["맞음"] == summary["전체"] else 1
+
+
 def main(argv):
     if argv[:1] in (["-h"], ["--help"]):
         print(__doc__.strip())
@@ -428,6 +467,8 @@ def main(argv):
         return 0
     servers, route, tools = connect(conf)
     try:
+        if argv[:1] == ["bench"] and len(argv) == 2:
+            return bench(conf, route, tools, argv[1])
         if argv[:1] == ["--tools"]:
             for t in tools:
                 print(t["function"]["name"], "-", t["function"]["description"])

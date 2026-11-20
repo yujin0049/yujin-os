@@ -95,22 +95,50 @@ def chat(llm, messages, tools):
         return json.load(r)["choices"][0]["message"]
 
 
+def connect(conf):
+    servers, route, tools = [], {}, []
+    for name, cmd in conf["mcp"].items():
+        s = MCP(name, cmd)
+        servers.append(s)
+        for t in s.tools:
+            fn = "%s__%s" % (name, t["name"])
+            route[fn] = (s, t["name"])
+            tools.append({"type": "function", "function": {
+                "name": fn, "description": t.get("description", ""),
+                "parameters": t.get("inputSchema") or {"type": "object", "properties": {}}}})
+    return servers, route, tools
+
+
+def ask(conf, route, tools, question):
+    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}]
+    used = []
+    for _ in range(int(conf["max_steps"])):
+        m = chat(conf["llm"], messages, tools)
+        calls = m.get("tool_calls") or []
+        messages.append({k: v for k, v in m.items() if k in ("role", "content", "tool_calls")})
+        if not calls:
+            return {"answer": (m.get("content") or "").strip(), "tools": used}
+        for c in calls:
+            fn = c["function"]["name"]
+            try:
+                args = json.loads(c["function"].get("arguments") or "{}")
+                s, tn = route[fn]
+                res = s.call("tools/call", {"name": tn, "arguments": args})
+                text = "\n".join(x.get("text", "") for x in res.get("content", []) if x.get("type") == "text")
+            except (KeyError, ValueError, RuntimeError) as e:
+                text = "오류: %s" % e
+            used.append(fn)
+            messages.append({"role": "tool", "tool_call_id": c.get("id", fn), "content": text[:20000]})
+    return {"answer": "", "tools": used, "error": "단계가 %s번을 넘어 멈췄습니다. 질문을 좁혀 주세요." % conf["max_steps"]}
+
+
 def main(argv):
     if argv[:1] in (["-h"], ["--help"]):
         print(__doc__.strip())
         return 0
     conf = load_conf()
-    servers, route, tools = [], {}, []
+    servers, route, tools = connect(conf)
     try:
-        for name, cmd in conf["mcp"].items():
-            s = MCP(name, cmd)
-            servers.append(s)
-            for t in s.tools:
-                fn = "%s__%s" % (name, t["name"])
-                route[fn] = (s, t["name"])
-                tools.append({"type": "function", "function": {
-                    "name": fn, "description": t.get("description", ""),
-                    "parameters": t.get("inputSchema") or {"type": "object", "properties": {}}}})
         if argv[:1] == ["--tools"]:
             for t in tools:
                 print(t["function"]["name"], "-", t["function"]["description"])
@@ -119,27 +147,14 @@ def main(argv):
         if not q:
             print(__doc__.strip())
             return 2
-        messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": q}]
-        for _ in range(int(conf["max_steps"])):
-            m = chat(conf["llm"], messages, tools)
-            calls = m.get("tool_calls") or []
-            messages.append({k: v for k, v in m.items() if k in ("role", "content", "tool_calls")})
-            if not calls:
-                print((m.get("content") or "").strip())
-                return 0
-            for c in calls:
-                fn = c["function"]["name"]
-                try:
-                    args = json.loads(c["function"].get("arguments") or "{}")
-                    s, tn = route[fn]
-                    res = s.call("tools/call", {"name": tn, "arguments": args})
-                    text = "\n".join(x.get("text", "") for x in res.get("content", []) if x.get("type") == "text")
-                except (KeyError, ValueError, RuntimeError) as e:
-                    text = "오류: %s" % e
-                print("· %s" % fn, file=sys.stderr)
-                messages.append({"role": "tool", "tool_call_id": c.get("id", fn), "content": text[:20000]})
-        print("yujin-ask: 단계가 %s번을 넘어 멈췄습니다. 질문을 좁혀 주세요." % conf["max_steps"], file=sys.stderr)
-        return 1
+        out = ask(conf, route, tools, q)
+        for fn in out["tools"]:
+            print("· %s" % fn, file=sys.stderr)
+        if "error" in out:
+            print("yujin-ask: " + out["error"], file=sys.stderr)
+            return 1
+        print(out["answer"])
+        return 0
     finally:
         for s in servers:
             s.close()

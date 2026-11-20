@@ -24,9 +24,11 @@ ARG GROKBOT_APP_SHA256=
 ARG GROKBOT_APP_KIND=auto
 ARG GROKBOT_APP_EXEC=
 ARG GROKBOT_FLATPAK_ID=
-ARG GROKBOT_WEB_URL=
+# yujin-os: 부팅 화면은 로컬 모델(llama-server)의 채팅 화면
+ARG GROKBOT_WEB_URL=http://127.0.0.1:8080
 ARG GROKBOT_TARGET_ARCH
-ARG GROKBOT_DISABLE_BUNDLED_APP
+# yujin-os: 비공개 Grok Bot 앱을 넣지 않음(로컬 AI 우선)
+ARG GROKBOT_DISABLE_BUNDLED_APP=1
 # Set by podman/buildah from the build platform. amd64 or arm64.
 ARG TARGETARCH
 

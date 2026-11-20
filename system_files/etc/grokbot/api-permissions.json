@@ -42,5 +42,15 @@
       "updates": "ask",
       "printing": "allow"
     }
+  },
+  "_agents_comment": "yujin-os: 'agents' lists systemd units (.service) that run AI agents. Such a unit is not treated as the local user: it gets exactly the scopes listed, reads included, and every other scope is denied without a prompt. Only this system file can list agents (the user's legacy file cannot). User grants for the agent's principal (local:uid=N:unit=<unit>) still win. camera, microphone, power and updates always ask. See docs/OS_API.md 'Agents'.",
+  "agents": {
+    "yujin-agent.service": {
+      "system": "allow",
+      "notifications": "allow",
+      "files": "ask",
+      "files-write": "ask",
+      "apps": "ask"
+    }
   }
 }

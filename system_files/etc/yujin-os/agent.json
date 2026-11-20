@@ -1,0 +1,6 @@
+{
+  "_comment": "yujin-ask 설정. 모델은 이 기기의 llama-server만. MCP 서버는 ~/.config/yujin-os/agent.json 의 mcp 에 넣는다(예: yujin-db mcp_server.py).",
+  "llm": "http://127.0.0.1:8080/v1",
+  "mcp": {},
+  "max_steps": 8
+}

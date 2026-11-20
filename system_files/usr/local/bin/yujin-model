@@ -1,0 +1,30 @@
+#!/bin/bash
+# yujin-model — 로컬 모델 받기·고르기 (Ollama 없이 llama.cpp만)
+#   yujin-model list                      받아 둔 모델
+#   yujin-model get <hf저장소> <파일.gguf>   Hugging Face에서 받기 (예: meta-models/Muse-Glimmer-30B-GGUF Muse-Glimmer-30B-Q4_K_M.gguf)
+#   yujin-model use <파일.gguf>             이 모델로 바꾸고 서버 다시 시작
+#   yujin-model status                    서버 상태
+set -euo pipefail
+DIR=/var/models
+need_root() { [[ $EUID -eq 0 ]] || exec sudo "$0" "$@"; }
+case "${1:-list}" in
+  list)
+    ls -lh "$DIR"/*.gguf 2>/dev/null || echo "받아 둔 모델 없음"
+    [[ -L "$DIR/current.gguf" ]] && echo "지금 쓰는 모델: $(readlink "$DIR/current.gguf")" ;;
+  get)
+    need_root "$@"
+    repo="${2:?저장소}"; file="${3:?파일}"
+    [[ "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$file" =~ ^[A-Za-z0-9._-]+\.gguf$ ]] || { echo "저장소·파일 이름 형식이 이상함" >&2; exit 1; }
+    curl -fL --retry 3 -o "$DIR/$file.part" "https://huggingface.co/$repo/resolve/main/$file"
+    mv "$DIR/$file.part" "$DIR/$file"; echo "받음: $DIR/$file" ;;
+  use)
+    need_root "$@"
+    file="${2:?파일}"; [[ -f "$DIR/$file" ]] || { echo "없음: $DIR/$file" >&2; exit 1; }
+    ln -sfn "$file" "$DIR/current.gguf"
+    systemctl restart yujin-llm.service || systemctl start yujin-llm.service
+    echo "지금 모델: $file" ;;
+  status)
+    systemctl --no-pager status yujin-llm.service | head -12 || true
+    curl -fsS http://127.0.0.1:8080/health && echo || echo "서버 응답 없음" ;;
+  *) sed -n 2,7p "$0"; exit 1 ;;
+esac

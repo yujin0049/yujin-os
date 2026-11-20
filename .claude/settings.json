@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash",
+      "Edit",
+      "Write",
+      "Read",
+      "Glob",
+      "Grep",
+      "WebSearch",
+      "Artifact",
+      "SendUserFile",
+      "mcp__claude-code-remote__send_message",
+      "mcp__claude-code-remote__list_events",
+      "mcp__claude-code-remote__get_event",
+      "mcp__claude-code-remote__get_session",
+      "mcp__claude-code-remote__list_sessions",
+      "mcp__claude-code-remote__set_session_title",
+      "mcp__claude-code-remote__set_session_tags",
+      "mcp__claude-code-remote__send_later",
+      "mcp__claude-code-remote__list_triggers",
+      "mcp__claude-code-remote__get_trigger",
+      "mcp__claude-code-remote__list_repos",
+      "mcp__claude-code-remote__read_documentation",
+      "mcp__Notion__notion-fetch",
+      "mcp__Notion__notion-search",
+      "mcp__Notion__notion-create-pages",
+      "mcp__Notion__notion-update-page",
+      "mcp__Notion__notion-create-database",
+      "mcp__Notion__notion-query-data-sources",
+      "mcp__Google_Sheets__get_spreadsheet",
+      "mcp__Google_Sheets__get_values",
+      "mcp__Claude_Docs__batch",
+      "mcp__Claude_Docs__update",
+      "mcp__Claude_Docs__guide"
+    ]
+  }
+}

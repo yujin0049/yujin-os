@@ -25,4 +25,4 @@ yujin-model status
 - 로컬 에이전트 앱(지금은 llama-server 기본 채팅 화면)과 grokbotd MCP 연결
 - 업데이트 서명 키를 이 포크 것으로 바꾸기(`policy.json`, `grokbotos.pub`, 저장소 비밀값 `SIGNING_SECRET`)
 - 실기기·SELinux enforcing 검증
-- `llama.cpp` 이미지 태그를 digest로 고정
+- ~~`llama.cpp` 이미지 태그를 digest로 고정~~ (11.20. 고정함)

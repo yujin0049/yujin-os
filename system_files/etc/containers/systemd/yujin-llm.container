@@ -7,8 +7,8 @@ ConditionPathExists=/var/models/current.gguf
 After=network-online.target
 
 [Container]
-# 이미지 태그는 받기 전에 확인하고 digest로 고정할 것(설계서 「모델 층」)
-Image=ghcr.io/ggml-org/llama.cpp:server-vulkan
+# 이미지는 digest로 고정(2026-11-20 server-vulkan). 올릴 때는 새 digest를 확인하고 이 줄만 바꾼다.
+Image=ghcr.io/ggml-org/llama.cpp:server-vulkan@sha256:5c73025f2072135ad37e306db9a57c685d8a349cfa5cb82b5c0f385b97567c94
 ContainerName=yujin-llm
 Volume=/var/models:/models:ro,Z
 AddDevice=/dev/dri
